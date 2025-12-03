@@ -1,2 +1,6 @@
 streamlit
 openai
+dotenv
+pandas
+os
+sqlite3
