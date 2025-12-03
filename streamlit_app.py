@@ -5,10 +5,29 @@ import openai
 import os
 import sqlite3
 
-# Load API keys from .env or environment
+# Load API keys from .env for local development
 from dotenv import load_dotenv
 load_dotenv()
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+# Prefer Streamlit secrets (Streamlit Cloud) then environment variables
+OPENAI_API_KEY = None
+try:
+    OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY")
+except Exception:
+    # If st.secrets is unavailable for any reason, fall back to env
+    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+if not OPENAI_API_KEY:
+    # final fallback to environment variable in case above didn't pick it up
+    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+if not OPENAI_API_KEY:
+    st.error(
+        "OpenAI API key not found. Set `OPENAI_API_KEY` in Streamlit Secrets (recommended) or as an environment variable.\n"
+        "See README for instructions. The app cannot call OpenAI without this key."
+    )
+    # Stop further execution to avoid the low-level redacted OpenAI error
+    st.stop()
 
 openai.api_key = OPENAI_API_KEY
 
