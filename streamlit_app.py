@@ -291,19 +291,35 @@ with tabs[0]:
 with tabs[1]:
     st.header("Data Chatbot (Data-Only Answers)")
     st.subheader("Ask anything about RideAustin trips, drivers, and fares")
-    # Render the conversation first so the input appears below it
-    for msg in st.session_state["messages"]:
-        st.chat_message(msg["role"]).write(msg["content"])
 
-    # Input lives below the messages
-    user_input = st.chat_input("Ask a question about the data...")
+    # Messages at the top
+    chat_container = st.container()
+    with chat_container:
+        for msg in st.session_state["messages"]:
+            st.chat_message(msg["role"]).write(msg["content"])
+
+    # Spinner BELOW messages, ABOVE input
+    spinner_container = st.container()
+
+    # Input at the bottom
+    input_container = st.container()
+    with input_container:
+        user_input = st.chat_input("Ask a question about the data...")
+
     if user_input:
-        # save user message and display it immediately
+        # Save + show user message
         st.session_state["messages"].append({"role": "user", "content": user_input})
-        st.chat_message("user").write(user_input)
+        with chat_container:
+            st.chat_message("user").write(user_input)
 
-        with st.spinner("Thinking..."):
-            answer = answer_from_sql(user_input)
+        # Spinner now appears BELOW the messages + ABOVE input
+        with spinner_container:
+            with st.spinner("Thinking..."):
+                answer = answer_from_sql(user_input)
 
+        spinner_container.empty()
+
+        # Save + show assistant message
         st.session_state["messages"].append({"role": "assistant", "content": answer})
-        st.chat_message("assistant").write(answer)
+        with chat_container:
+            st.chat_message("assistant").write(answer)
