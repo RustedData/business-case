@@ -18,8 +18,14 @@ import streamlit as st
 
 @st.cache_data(show_spinner=True)
 def load_data():
-    CSV_URL = "https://www.dropbox.com/scl/fi/9k53mrii5tf35r4443cmv/RideAustin_Weather.csv?rlkey=bg0pl1cmn542ypxzt92y16wxt&st=koq4dks4&dl=1"  # replace with your actual link
-    return pd.read_csv(CSV_URL, encoding="utf-8", delimiter=",", on_bad_lines="skip")
+    CSV_URL = "https://www.dropbox.com/scl/fi/9k53mrii5tf35r4443cmv/RideAustin_Weather.csv?rlkey=bg0pl1cmn542ypxzt92y16wxt&st=koq4dks4&dl=1"
+    return pd.read_csv(
+        CSV_URL, 
+        encoding="utf-8", 
+        delimiter=",", 
+        on_bad_lines="skip",
+        low_memory=False  # Fix the DtypeWarning
+    )
 
 df = load_data()
 
