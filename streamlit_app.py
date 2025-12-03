@@ -291,13 +291,19 @@ with tabs[0]:
 with tabs[1]:
     st.header("Data Chatbot (Data-Only Answers)")
     st.subheader("Ask anything about RideAustin trips, drivers, and fares")
+    # Render the conversation first so the input appears below it
+    for msg in st.session_state["messages"]:
+        st.chat_message(msg["role"]).write(msg["content"])
 
+    # Input lives below the messages
     user_input = st.chat_input("Ask a question about the data...")
     if user_input:
+        # save user message and display it immediately
         st.session_state["messages"].append({"role": "user", "content": user_input})
-        for msg in st.session_state["messages"]:
-            st.chat_message(msg["role"]).write(msg["content"])
+        st.chat_message("user").write(user_input)
+
         with st.spinner("Thinking..."):
             answer = answer_from_sql(user_input)
+
         st.session_state["messages"].append({"role": "assistant", "content": answer})
         st.chat_message("assistant").write(answer)
