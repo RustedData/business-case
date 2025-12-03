@@ -252,7 +252,7 @@ Error: {e}
 
     # Generate a final conversational answer strictly based on the returned data
     answer_prompt = f"""
-You are a helpful assistant. Use the following data (from a SQL query) to answer the user's question in a clear, conversational way. If the answer is not in the data, say 'I don't know.'
+You are a helpful assistant. Use the following data (from a SQL query) to answer the user's question in a clear, conversational way. If the answer is not in the data, say 'I'm only able to answer questions about the RideAustin data.'
 
 Data:
 {result_sample.to_string(index=False)}
