@@ -1,6 +1,6 @@
 streamlit
 openai
-dotenv
+python-dotenv
 pandas
 os
 sqlite3
