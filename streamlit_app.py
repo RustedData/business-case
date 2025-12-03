@@ -4,6 +4,7 @@ import pandas as pd
 import openai
 import os
 import sqlite3
+import tempfile
 
 # Load API keys from .env for local development
 from dotenv import load_dotenv
@@ -64,7 +65,7 @@ sample_df = load_data_sample()
 
 # Store dataset and DB in session state; full data / DB will be created lazily
 st.session_state.setdefault("df", sample_df)
-st.session_state.setdefault("conn", None)
+st.session_state.setdefault("db_path", None)
 st.session_state.setdefault("columns", list(sample_df.columns))
 st.session_state.setdefault("column_types", {})
 st.session_state.setdefault("loaded_full", False)
@@ -79,14 +80,20 @@ def ensure_full_loaded():
     except Exception as e:
         st.error(f"Failed to load full dataset: {e}")
         return
-    conn = sqlite3.connect(":memory:")
+    # Write the full dataframe to a temporary on-disk SQLite DB so each
+    # request can open its own connection (avoids cross-thread sqlite errors).
     try:
-        full_df.to_sql("rides", conn, index=False, if_exists="replace")
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".db")
+        db_path = tmp.name
+        tmp.close()
+        wconn = sqlite3.connect(db_path)
+        full_df.to_sql("rides", wconn, index=False, if_exists="replace")
+        wconn.close()
     except Exception as e:
-        st.error(f"Failed to write data to in-memory DB: {e}")
+        st.error(f"Failed to write data to temporary DB file: {e}")
         return
     st.session_state["df"] = full_df
-    st.session_state["conn"] = conn
+    st.session_state["db_path"] = db_path
     st.session_state["columns"] = list(full_df.columns)
     st.session_state["column_types"] = get_column_types(full_df)
     st.session_state["loaded_full"] = True
@@ -144,7 +151,7 @@ def answer_from_sql(question):
     ensure_full_loaded()
 
     df = st.session_state.get("df")
-    conn = st.session_state.get("conn")
+    db_path = st.session_state.get("db_path")
     columns = st.session_state.get("columns", list(df.columns))
     column_types = st.session_state.get("column_types", get_column_types(df))
     import re
@@ -179,12 +186,21 @@ def answer_from_sql(question):
     sql = extract_sql(raw_sql)
     # Execute SQL. If no persistent conn exists (we're on sample), create a temp in-memory DB.
     temp_conn = None
-    exec_conn = conn
-    if exec_conn is None:
+    exec_conn = None
+    opened_here = False
+    if db_path:
+        try:
+            exec_conn = sqlite3.connect(db_path)
+            opened_here = True
+        except Exception as e:
+            return f"Failed to open DB at {db_path}: {e}"
+    else:
+        # Use an in-memory temporary DB built from the sample df for quick queries
         try:
             temp_conn = sqlite3.connect(":memory:")
             df.to_sql("rides", temp_conn, index=False, if_exists="replace")
             exec_conn = temp_conn
+            opened_here = True
         except Exception as e:
             if temp_conn:
                 temp_conn.close()
@@ -217,8 +233,8 @@ Error: {e}
                     st.error(f"OpenAI error while attempting to fix SQL: {oe}")
                     return "Error: could not repair SQL. See logs."
             else:
-                if temp_conn:
-                    temp_conn.close()
+                if opened_here and exec_conn:
+                    exec_conn.close()
                 return f"SQL Error: {e}\nSQL: {sql}"
     result_sample = result_df.head(50)
     prompt = f"""
@@ -242,8 +258,8 @@ Please provide a concise, conversational answer based only on the data above.
         st.error(f"OpenAI error while generating answer: {e}")
         return "Error: failed to generate a natural language answer from the query results."
     finally:
-        if 'temp_conn' in locals() and temp_conn:
-            temp_conn.close()
+        if opened_here and exec_conn:
+            exec_conn.close()
 
 
 st.title("Data Chatbot (Data-Only Answers)")
