@@ -115,14 +115,14 @@ def find_longest_trip(df: pd.DataFrame):
 
 
 # Load a small sample immediately so the app starts quickly for health checks
-df = load_data_full()
+sample_df = load_data_sample()
 
 # Session state for data + DB path (full DB stored in a temp file when loaded)
-st.session_state.setdefault("df", df)
+st.session_state.setdefault("df", sample_df)
 st.session_state.setdefault("db_path", None)
-st.session_state.setdefault("columns", list(df.columns))
+st.session_state.setdefault("columns", list(sample_df.columns))
 st.session_state.setdefault("column_types", {})
-st.session_state.setdefault("loaded_full", True)
+st.session_state.setdefault("loaded_full", False)
 
 
 def get_column_types(df: pd.DataFrame) -> dict:
