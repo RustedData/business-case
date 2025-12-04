@@ -1,4 +1,3 @@
-
 import streamlit as st
 import pandas as pd
 import openai
@@ -10,6 +9,13 @@ import matplotlib.pyplot as plt
 import numpy as np
 import folium
 import streamlit_folium as st_folium
+import logging
+import gc
+
+try:
+    import psutil
+except Exception:
+    psutil = None
 
 # Load API keys from .env for local development
 from dotenv import load_dotenv
@@ -134,6 +140,12 @@ def create_surge_by_hour_chart(df: pd.DataFrame):
     
     # Calculate average surge_factor for each half-hour bin
     surge_by_half_hour = work_df.groupby('half_hour_bin')['surge_factor'].mean()
+    # Ensure we have values for all 48 half-hour bins (0..47). Fill missing bins with 0.
+    try:
+        full_index = list(range(48))
+        surge_by_half_hour = surge_by_half_hour.reindex(full_index, fill_value=0)
+    except Exception:
+        pass
     
     # Create a polar (circular) plot
     fig = plt.figure(figsize=(10, 10))
@@ -151,7 +163,10 @@ def create_surge_by_hour_chart(df: pd.DataFrame):
     ax.set_theta_direction(-1)
     
     # Set the radial grid
-    ax.set_ylim(0, values.max() * 1.1)
+    vmax = float(values.max()) if len(values) > 0 else 1.0
+    if vmax <= 0:
+        vmax = 1.0
+    ax.set_ylim(0, vmax * 1.1)
     
     # Add hour labels at key positions (every 2 hours = 4 half-hour bins)
     hour_angles = np.linspace(0, 2*np.pi, 24, endpoint=False)
@@ -171,6 +186,42 @@ def create_surge_by_hour_chart(df: pd.DataFrame):
 
 # Load a small sample immediately so the app starts quickly for health checks
 sample_df = load_data_sample()
+
+# --- memory logging helper -------------------------------------------------
+LOG_PATH = os.path.join(tempfile.gettempdir(), "streamlit_app_mem.log")
+logging.basicConfig(level=logging.INFO, filename=LOG_PATH, filemode="a", format="%(asctime)s %(levelname)s: %(message)s")
+logger = logging.getLogger(__name__)
+
+
+def get_memory_mb():
+    try:
+        if psutil:
+            return psutil.Process(os.getpid()).memory_info().rss / 1024 ** 2
+        # Fallback for POSIX without psutil (best-effort)
+        if os.name == "posix":
+            import resource
+
+            return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+    except Exception:
+        return None
+
+
+def log_memory(tag: str):
+    mem = get_memory_mb()
+    if mem is not None:
+        msg = f"{tag} memory: {mem:.1f} MB"
+    else:
+        msg = f"{tag} memory: unknown"
+    logger.info(msg)
+    # print to stdout so it's visible when running locally
+    try:
+        print(msg)
+    except Exception:
+        pass
+
+
+# Log memory after loading the small sample
+log_memory("after load_data_sample")
 
 # Session state for data + DB path (full DB stored in a temp file when loaded)
 st.session_state.setdefault("df", sample_df)
@@ -205,10 +256,12 @@ def ensure_full_loaded():
     """
     if st.session_state.get("loaded_full"):
         return
+    log_memory("ensure_full_loaded:start")
     try:
         full_df = load_data_full()
     except Exception as e:
         st.error(f"Failed to load full dataset: {e}")
+        log_memory("ensure_full_loaded:failed_load")
         return
 
     try:
@@ -217,16 +270,52 @@ def ensure_full_loaded():
         tmp.close()
         wconn = sqlite3.connect(db_path)
         full_df.to_sql("rides", wconn, index=False, if_exists="replace")
+        # After writing, try to get column names from PRAGMA and a small sample to infer types
+        try:
+            cur = wconn.cursor()
+            cur.execute("PRAGMA table_info(rides)")
+            cols_info = cur.fetchall()
+            all_columns = [r[1] for r in cols_info]
+        except Exception:
+            all_columns = list(full_df.columns)
+
+        try:
+            sample_df_from_db = pd.read_sql_query("SELECT * FROM rides LIMIT 1000", wconn)
+        except Exception:
+            sample_df_from_db = sample_df
+
         wconn.close()
+        log_memory("ensure_full_loaded:after_write_db")
     except Exception as e:
         st.error(f"Failed to write data to temporary DB file: {e}")
+        log_memory("ensure_full_loaded:failed_write")
         return
 
-    st.session_state["df"] = full_df
+    # Store only the DB path and column metadata in session state to avoid
+    # keeping the full dataframe in memory. Keep a small sample for UI conveniences.
     st.session_state["db_path"] = db_path
-    st.session_state["columns"] = list(full_df.columns)
-    st.session_state["column_types"] = get_column_types(full_df)
+    st.session_state["columns"] = all_columns
+    # infer column types from the small sample we pulled from DB
+    col_types = get_column_types(sample_df_from_db)
+    for c in all_columns:
+        if c not in col_types:
+            col_types[c] = "text"
+    st.session_state["column_types"] = col_types
     st.session_state["loaded_full"] = True
+
+    # Replace the large full dataframe in session with the small startup sample
+    try:
+        st.session_state["df"] = sample_df
+    except Exception:
+        pass
+
+    # Drop the large full_df reference and run GC to free memory
+    try:
+        del full_df
+    except Exception:
+        pass
+    gc.collect()
+    log_memory("ensure_full_loaded:done")
     
 
 def extract_sql(text: str) -> str:
@@ -291,6 +380,8 @@ def answer_from_sql(question: str) -> str:
     # Ensure full data available (lazy load)
     ensure_full_loaded()
 
+    log_memory("answer_from_sql:start")
+
     df = st.session_state.get("df")
     db_path = st.session_state.get("db_path")
     columns = st.session_state.get("columns", list(df.columns))
@@ -312,6 +403,7 @@ def answer_from_sql(question: str) -> str:
             exec_conn = sqlite3.connect(db_path)
             opened_here = True
         except Exception as e:
+            log_memory("answer_from_sql:failed_open_db")
             return f"Failed to open DB at {db_path}: {e}"
     else:
         # use an in-memory db built from the sample
@@ -322,15 +414,19 @@ def answer_from_sql(question: str) -> str:
         except Exception as e:
             if exec_conn:
                 exec_conn.close()
+            log_memory("answer_from_sql:failed_prep_inmemory")
             return f"Failed to prepare in-memory DB for sample execution: {e}"
 
     # Try executing and attempt a single automatic fix if execution fails
     result_df = None
     for attempt in range(2):
         try:
+            log_memory(f"answer_from_sql:before_exec_attempt_{attempt}")
             result_df = pd.read_sql_query(sql, exec_conn)
+            log_memory(f"answer_from_sql:after_exec_attempt_{attempt}")
             break
         except Exception as e:
+            log_memory(f"answer_from_sql:exec_error_attempt_{attempt}")
             if attempt == 0:
                 fix_prompt = f"""
 You are a SQL expert. The following SQL query resulted in an error when run on a SQLite database. Please fix the query. Only return the corrected SQL query, nothing else.
@@ -346,10 +442,12 @@ Error: {e}
                         max_tokens=1024,
                     )
                     sql = extract_sql(resp.choices[0].message.content)
+                    log_memory("answer_from_sql:got_sql_fix_from_llm")
                     continue
                 except Exception as oe:
                     if opened_here and exec_conn:
                         exec_conn.close()
+                    log_memory("answer_from_sql:openai_fix_failed")
                     st.error(f"OpenAI error while attempting to fix SQL: {oe}")
                     return "Error: could not repair SQL. See logs."
             else:
@@ -360,6 +458,7 @@ Error: {e}
     if result_df is None:
         if opened_here and exec_conn:
             exec_conn.close()
+        log_memory("answer_from_sql:no_results")
         return "No results returned."
 
     result_sample = result_df.head(50)
@@ -376,13 +475,16 @@ Question: {question}
 Please provide a concise, conversational answer based only on the data above.
 """
     try:
+        log_memory("answer_from_sql:before_call_openai_answer")
         resp = openai.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=[{"role": "user", "content": answer_prompt}],
             max_tokens=512,
         )
+        log_memory("answer_from_sql:after_call_openai_answer")
         return resp.choices[0].message.content.strip()
     except Exception as e:
+        log_memory("answer_from_sql:openai_answer_failed")
         st.error(f"OpenAI error while generating answer: {e}")
         return "Error: failed to generate a natural language answer from the query results."
     finally:
@@ -403,28 +505,59 @@ with tabs[0]:
     st.subheader("Distance Distribution (Boxplot)")
     try:
         ensure_full_loaded()
-        full_df = st.session_state["df"]
+        db_path = st.session_state.get("db_path")
+        cols = st.session_state.get("columns", list(st.session_state.get("df", pd.DataFrame()).columns))
 
-        # Try common distance column names first
+        # Try common distance column names first (check metadata, not the full DF)
         dist_col = None
         for c in ("distance_travelled", "distance_traveled", "distance_km", "distance"):
-            if c in full_df.columns:
+            if c in cols:
                 dist_col = c
                 break
 
-        if dist_col is not None:
-            # Source distances are in meters — convert to kilometers for display
-            distances = full_df[dist_col].dropna().astype(float) / 1000.0
-            st.caption(f"Note: values from column '{dist_col}' converted from meters to kilometers for display.")
+        if db_path and dist_col is not None:
+            # Query only the distance column from SQLite
+            conn = sqlite3.connect(db_path)
+            try:
+                q = f"SELECT {dist_col} FROM rides WHERE {dist_col} IS NOT NULL"
+                df_dist = pd.read_sql_query(q, conn)
+                distances = df_dist[dist_col].astype(float) / 1000.0
+                st.caption(f"Note: values from column '{dist_col}' converted from meters to kilometers for display.")
+            finally:
+                conn.close()
         else:
-            # Attempt to compute distances from lat/long if available
+            # Attempt to compute distances from lat/long if available (query only lat/long columns)
             latlon_cols = ["start_location_lat", "start_location_long", "end_location_lat", "end_location_long"]
-            if all(col in full_df.columns for col in latlon_cols):
-                clean = full_df.dropna(subset=latlon_cols).copy()
-                distances = clean.apply(lambda r: haversine_distance(r["start_location_lat"], r["start_location_long"], r["end_location_lat"], r["end_location_long"]), axis=1)
+            if db_path and all(col in cols for col in latlon_cols):
+                conn = sqlite3.connect(db_path)
+                try:
+                    q = (
+                        "SELECT start_location_lat, start_location_long, end_location_lat, end_location_long "
+                        "FROM rides WHERE start_location_lat IS NOT NULL AND start_location_long IS NOT NULL "
+                        "AND end_location_lat IS NOT NULL AND end_location_long IS NOT NULL"
+                    )
+                    df_latlon = pd.read_sql_query(q, conn)
+                    distances = df_latlon.apply(
+                        lambda r: haversine_distance(r["start_location_lat"], r["start_location_long"], r["end_location_lat"], r["end_location_long"]),
+                        axis=1,
+                    )
+                finally:
+                    conn.close()
             else:
-                st.info("No distance column found and insufficient lat/long columns to compute distances.")
-                distances = pd.Series([], dtype=float)
+                # Fallback to small in-memory sample (if present)
+                sample = st.session_state.get("df", pd.DataFrame())
+                if not sample.empty:
+                    if dist_col is not None and dist_col in sample.columns:
+                        distances = sample[dist_col].dropna().astype(float) / 1000.0
+                        st.caption(f"Note: values from column '{dist_col}' converted from meters to kilometers for display.")
+                    else:
+                        latlon_cols = ["start_location_lat", "start_location_long", "end_location_lat", "end_location_long"]
+                        if all(col in sample.columns for col in latlon_cols):
+                            clean = sample.dropna(subset=latlon_cols).copy()
+                            distances = clean.apply(lambda r: haversine_distance(r["start_location_lat"], r["start_location_long"], r["end_location_lat"], r["end_location_long"]), axis=1)
+                        else:
+                            st.info("No distance column found and insufficient lat/long columns to compute distances.")
+                            distances = pd.Series([], dtype=float)
 
         if distances.empty:
             st.write("No distance data available to plot.")
@@ -468,71 +601,137 @@ with tabs[0]:
     st.subheader("Longest Trip Visualization")
     try:
         ensure_full_loaded()
-        full_df = st.session_state["df"]
+        db_path = st.session_state.get("db_path")
+        cols = st.session_state.get("columns", list(st.session_state.get("df", pd.DataFrame()).columns))
 
         long_tabs = st.tabs(["Map", "Long Rides (>100 km)"])
 
-        # Map subtab: show the single longest trip
+        # Map subtab: show the single longest trip (query only lat/long columns)
         with long_tabs[0]:
             try:
-                longest_trip, distance_km = find_longest_trip(full_df)
-                st.write(f"**Longest Trip Distance:** {distance_km:.2f} km")
+                latlon_cols = ["start_location_lat", "start_location_long", "end_location_lat", "end_location_long"]
+                if db_path and all(c in cols for c in latlon_cols):
+                    conn = sqlite3.connect(db_path)
+                    try:
+                        q = (
+                            "SELECT start_location_lat, start_location_long, end_location_lat, end_location_long "
+                            "FROM rides WHERE start_location_lat IS NOT NULL AND start_location_long IS NOT NULL "
+                            "AND end_location_lat IS NOT NULL AND end_location_long IS NOT NULL"
+                        )
+                        df_latlon = pd.read_sql_query(q, conn)
+                    finally:
+                        conn.close()
 
-                start_lat = longest_trip['start_location_lat']
-                start_lon = longest_trip['start_location_long']
-                end_lat = longest_trip['end_location_lat']
-                end_lon = longest_trip['end_location_long']
+                    if df_latlon.empty:
+                        st.write("No valid lat/long pairs available to compute the longest trip.")
+                    else:
+                        longest_trip, distance_km = find_longest_trip(df_latlon)
+                        st.write(f"**Longest Trip Distance:** {distance_km:.2f} km")
 
-                center_lat = (start_lat + end_lat) / 2
-                center_lon = (start_lon + end_lon) / 2
+                        start_lat = longest_trip['start_location_lat']
+                        start_lon = longest_trip['start_location_long']
+                        end_lat = longest_trip['end_location_lat']
+                        end_lon = longest_trip['end_location_long']
 
-                m = folium.Map(location=[center_lat, center_lon], zoom_start=6, tiles="OpenStreetMap")
-                folium.Marker(location=[start_lat, start_lon], popup="Start Location", tooltip="Start", icon=folium.Icon(color="green", icon="info-sign")).add_to(m)
-                folium.Marker(location=[end_lat, end_lon], popup="End Location", tooltip="End", icon=folium.Icon(color="red", icon="info-sign")).add_to(m)
-                folium.PolyLine(locations=[[start_lat, start_lon], [end_lat, end_lon]], color="blue", weight=2, opacity=0.8, popup=f"Distance: {distance_km:.2f} km").add_to(m)
-                st_folium.st_folium(m, width=800, height=500)
+                        center_lat = (start_lat + end_lat) / 2
+                        center_lon = (start_lon + end_lon) / 2
+
+                        m = folium.Map(location=[center_lat, center_lon], zoom_start=6, tiles="OpenStreetMap")
+                        folium.Marker(location=[start_lat, start_lon], popup="Start Location", tooltip="Start", icon=folium.Icon(color="green", icon="info-sign")).add_to(m)
+                        folium.Marker(location=[end_lat, end_lon], popup="End Location", tooltip="End", icon=folium.Icon(color="red", icon="info-sign")).add_to(m)
+                        folium.PolyLine(locations=[[start_lat, start_lon], [end_lat, end_lon]], color="blue", weight=2, opacity=0.8, popup=f"Distance: {distance_km:.2f} km").add_to(m)
+                        st_folium.st_folium(m, width=800, height=500)
+                else:
+                    # fallback to small sample in memory
+                    sample = st.session_state.get("df", pd.DataFrame())
+                    if sample.empty:
+                        st.write("No data available to compute the longest trip.")
+                    else:
+                        longest_trip, distance_km = find_longest_trip(sample)
+                        st.write(f"**Longest Trip Distance:** {distance_km:.2f} km")
+                        try:
+                            start_lat = longest_trip['start_location_lat']
+                            start_lon = longest_trip['start_location_long']
+                            end_lat = longest_trip['end_location_lat']
+                            end_lon = longest_trip['end_location_long']
+                            center_lat = (start_lat + end_lat) / 2
+                            center_lon = (start_lon + end_lon) / 2
+                            m = folium.Map(location=[center_lat, center_lon], zoom_start=6, tiles="OpenStreetMap")
+                            folium.Marker(location=[start_lat, start_lon], popup="Start Location", tooltip="Start", icon=folium.Icon(color="green", icon="info-sign")).add_to(m)
+                            folium.Marker(location=[end_lat, end_lon], popup="End Location", tooltip="End", icon=folium.Icon(color="red", icon="info-sign")).add_to(m)
+                            folium.PolyLine(locations=[[start_lat, start_lon], [end_lat, end_lon]], color="blue", weight=2, opacity=0.8, popup=f"Distance: {distance_km:.2f} km").add_to(m)
+                            st_folium.st_folium(m, width=800, height=500)
+                        except Exception:
+                            st.write("Could not render map for the longest trip sample.")
             except Exception as me:
                 st.error(f"Error loading longest-trip map: {me}")
 
-        # Long Rides subtab: show all rides with distance > 100 km
+        # Long Rides subtab: show all rides with distance > 100 km (query only needed columns)
         with long_tabs[1]:
             try:
-                # Determine distances (look for distance column or compute from lat/lon)
                 dist_col = None
                 for c in ("distance_travelled", "distance_traveled", "distance_km", "distance"):
-                    if c in full_df.columns:
+                    if c in cols:
                         dist_col = c
                         break
 
-                if dist_col is not None:
-                    # convert meters -> kilometers
-                    distances_km = full_df[dist_col].dropna().astype(float) / 1000.0
-                    df_with_dist = full_df.loc[distances_km.index].copy()
-                    df_with_dist["_distance_km"] = distances_km
+                if db_path and dist_col is not None:
+                    conn = sqlite3.connect(db_path)
+                    try:
+                        q = (
+                            f"SELECT {dist_col}, start_location_lat, start_location_long, end_location_lat, end_location_long "
+                            f"FROM rides WHERE {dist_col} IS NOT NULL"
+                        )
+                        df_with_dist = pd.read_sql_query(q, conn)
+                        df_with_dist['_distance_km'] = df_with_dist[dist_col].astype(float) / 1000.0
+                    finally:
+                        conn.close()
+                elif db_path and all(col in cols for col in ["start_location_lat", "start_location_long", "end_location_lat", "end_location_long"]):
+                    conn = sqlite3.connect(db_path)
+                    try:
+                        q = (
+                            "SELECT start_location_lat, start_location_long, end_location_lat, end_location_long "
+                            "FROM rides WHERE start_location_lat IS NOT NULL AND start_location_long IS NOT NULL "
+                            "AND end_location_lat IS NOT NULL AND end_location_long IS NOT NULL"
+                        )
+                        df_latlon = pd.read_sql_query(q, conn)
+                        df_latlon['_distance_km'] = df_latlon.apply(lambda r: haversine_distance(r['start_location_lat'], r['start_location_long'], r['end_location_lat'], r['end_location_long']), axis=1)
+                        df_with_dist = df_latlon
+                    finally:
+                        conn.close()
                 else:
-                    latlon_cols = ["start_location_lat", "start_location_long", "end_location_lat", "end_location_long"]
-                    if all(col in full_df.columns for col in latlon_cols):
-                        clean = full_df.dropna(subset=latlon_cols).copy()
-                        clean["_distance_km"] = clean.apply(lambda r: haversine_distance(r["start_location_lat"], r["start_location_long"], r["end_location_lat"], r["end_location_long"]), axis=1)
-                        df_with_dist = clean
-                    else:
-                        st.info("No distance column and insufficient lat/long columns to compute distances.")
+                    # fallback to small sample
+                    sample = st.session_state.get('df', pd.DataFrame())
+                    if sample.empty:
                         df_with_dist = pd.DataFrame()
+                    else:
+                        if dist_col is not None and dist_col in sample.columns:
+                            df_with_dist = sample[[dist_col, 'start_location_lat', 'start_location_long', 'end_location_lat', 'end_location_long']].dropna(subset=[dist_col])
+                            df_with_dist['_distance_km'] = df_with_dist[dist_col].astype(float) / 1000.0
+                        else:
+                            latlon_cols = ['start_location_lat', 'start_location_long', 'end_location_lat', 'end_location_long']
+                            if all(col in sample.columns for col in latlon_cols):
+                                clean = sample.dropna(subset=latlon_cols).copy()
+                                clean['_distance_km'] = clean.apply(lambda r: haversine_distance(r['start_location_lat'], r['start_location_long'], r['end_location_lat'], r['end_location_long']), axis=1)
+                                df_with_dist = clean
+                            else:
+                                df_with_dist = pd.DataFrame()
 
                 if df_with_dist.empty:
                     st.write("No rides available to show for > 100 km filter.")
                 else:
-                    long_rides = df_with_dist[df_with_dist["_distance_km"] > 100.0].copy()
+                    long_rides = df_with_dist[df_with_dist['_distance_km'] > 100.0].copy()
                     st.write(f"Found {len(long_rides)} rides with distance > 100 km.")
                     if long_rides.empty:
                         st.write("No rides exceed 100 km.")
                     else:
-                        #st.dataframe(long_rides.head(200), use_container_width=True)
                         try:
-                            m2 = folium.Map(location=[long_rides.iloc[0]["start_location_lat"], long_rides.iloc[0]["start_location_long"]], zoom_start=6, tiles="OpenStreetMap")
+                            m2 = folium.Map(location=[long_rides.iloc[0].get('start_location_lat', 0), long_rides.iloc[0].get('start_location_long', 0)], zoom_start=6, tiles="OpenStreetMap")
                             for _, row in long_rides.head(500).iterrows():
-                                folium.CircleMarker(location=[row["start_location_lat"], row["start_location_long"]], radius=3, color="green", fill=True, fill_opacity=0.7).add_to(m2)
-                                folium.CircleMarker(location=[row["end_location_lat"], row["end_location_long"]], radius=3, color="red", fill=True, fill_opacity=0.7).add_to(m2)
+                                if pd.notna(row.get('start_location_lat')) and pd.notna(row.get('start_location_long')):
+                                    folium.CircleMarker(location=[row['start_location_lat'], row['start_location_long']], radius=3, color='green', fill=True, fill_opacity=0.7).add_to(m2)
+                                if pd.notna(row.get('end_location_lat')) and pd.notna(row.get('end_location_long')):
+                                    folium.CircleMarker(location=[row['end_location_lat'], row['end_location_long']], radius=3, color='red', fill=True, fill_opacity=0.7).add_to(m2)
                             st_folium.st_folium(m2, width=800, height=500)
                         except Exception:
                             pass
@@ -545,7 +744,9 @@ with tabs[0]:
     st.subheader("Correlation Matrix")
     try:
         ensure_full_loaded()
-        full_df = st.session_state["df"]
+        db_path = st.session_state.get("db_path")
+        cols = st.session_state.get("columns", list(st.session_state.get("df", pd.DataFrame()).columns))
+        column_types = st.session_state.get("column_types", {})
 
         # User-provided rename map for display
         rename_map = {
@@ -554,16 +755,21 @@ with tabs[0]:
             "AWND": "average wind speed",
         }
 
-        # Identify numeric columns from dataframe
-        numeric_cols = list(full_df.select_dtypes(include=[np.number]).columns)
+        # Identify numeric columns from metadata (fallback to cols list)
+        numeric_cols = [c for c, t in column_types.items() if t == "numeric"]
+        if not numeric_cols:
+            # fallback: attempt to infer from small sample
+            sample = st.session_state.get("df", pd.DataFrame())
+            if not sample.empty:
+                numeric_cols = list(sample.select_dtypes(include=[np.number]).columns)
 
         # Exclude columns that should not be selectable for correlation (location, ids, etc.)
         exclude_cols = {"end_location_lat", "end_location_long", "start_location_lat", "start_location_long", "charity_id", "free_credit_used"}
-        numeric_cols = [c for c in numeric_cols if c not in exclude_cols]
+        numeric_cols = [c for c in numeric_cols if c not in exclude_cols and c in cols]
 
         # Ensure any specifically mentioned columns are included if present (but respect excludes)
         for c in ["distance_travelled","driver_rating","rider_rating","surge_factor","PRCP","Tmax","Tmin","AWND","GustSpeed2","Fog","HeavyFog","Thunder","Year","Rating"]:
-            if c in full_df.columns and c not in numeric_cols and c not in exclude_cols:
+            if c in cols and c not in numeric_cols and c not in exclude_cols:
                 numeric_cols.append(c)
 
         # Build labelled options: "DisplayName — original_col"
@@ -574,28 +780,44 @@ with tabs[0]:
             # Parse selected original column names
             selected_cols = [c.split(" — ")[-1] for c in chosen]
 
+            # Query only the selected columns from SQLite when available
+            if db_path:
+                conn = sqlite3.connect(db_path)
+                try:
+                    cols_sql = ", ".join([f"\"{c}\"" for c in selected_cols])
+                    q = f"SELECT {cols_sql} FROM rides"
+                    corr_df = pd.read_sql_query(q, conn)
+                finally:
+                    conn.close()
+            else:
+                sample = st.session_state.get("df", pd.DataFrame())
+                corr_df = sample[selected_cols].copy() if not sample.empty else pd.DataFrame()
+
             # Convert selected columns to numeric (coerce errors)
-            corr_df = full_df[selected_cols].apply(pd.to_numeric, errors="coerce")
-            corr = corr_df.corr()
-
-            st.write("Correlation matrix (Pearson):")
-            #st.dataframe(corr, use_container_width=True)
-
-            # Heatmap using matplotlib
             try:
-                fig, ax = plt.subplots(figsize=(max(4, len(selected_cols)), max(4, len(selected_cols))))
-                im = ax.imshow(corr.values, cmap="RdBu", vmin=-1, vmax=1)
-                ax.set_xticks(range(len(selected_cols)))
-                ax.set_yticks(range(len(selected_cols)))
-                ax.set_xticklabels([rename_map.get(c, c) for c in selected_cols], rotation=45, ha="right")
-                ax.set_yticklabels([rename_map.get(c, c) for c in selected_cols])
-                # annotate
-                for (i, j), val in np.ndenumerate(corr.values):
-                    ax.text(j, i, f"{val:.2f}", ha="center", va="center", color="black", fontsize=9)
-                fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-                st.pyplot(fig)
+                corr_df = corr_df.apply(pd.to_numeric, errors="coerce")
+                corr = corr_df.corr()
             except Exception as e:
-                st.error(f"Failed to draw heatmap: {e}")
+                st.error(f"Failed to compute correlation: {e}")
+                corr = None
+
+            if corr is not None:
+                st.write("Correlation matrix (Pearson):")
+                # Heatmap using matplotlib
+                try:
+                    fig, ax = plt.subplots(figsize=(max(4, len(selected_cols)), max(4, len(selected_cols))))
+                    im = ax.imshow(corr.values, cmap="RdBu", vmin=-1, vmax=1)
+                    ax.set_xticks(range(len(selected_cols)))
+                    ax.set_yticks(range(len(selected_cols)))
+                    ax.set_xticklabels([rename_map.get(c, c) for c in selected_cols], rotation=45, ha="right")
+                    ax.set_yticklabels([rename_map.get(c, c) for c in selected_cols])
+                    # annotate
+                    for (i, j), val in np.ndenumerate(corr.values):
+                        ax.text(j, i, f"{val:.2f}", ha="center", va="center", color="black", fontsize=9)
+                    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+                    st.pyplot(fig)
+                except Exception as e:
+                    st.error(f"Failed to draw heatmap: {e}")
         elif chosen:
             st.info("Please select at least two numeric columns to compute correlation.")
         else:
@@ -607,8 +829,19 @@ with tabs[0]:
     st.subheader("Surge Factor by Time of Day")
     try:
         ensure_full_loaded()
-        full_df = st.session_state["df"]
-        fig, surge_by_half_hour = create_surge_by_hour_chart(full_df)
+        db_path = st.session_state.get("db_path")
+        # try to query only the two needed columns from SQLite to reduce memory
+        if db_path:
+            conn = sqlite3.connect(db_path)
+            try:
+                q = "SELECT started_on, surge_factor FROM rides WHERE started_on IS NOT NULL AND surge_factor IS NOT NULL"
+                df_surge = pd.read_sql_query(q, conn)
+            finally:
+                conn.close()
+        else:
+            df_surge = st.session_state.get("df", pd.DataFrame())
+
+        fig, surge_by_half_hour = create_surge_by_hour_chart(df_surge)
         
         # Display the figure
         st.pyplot(fig)
