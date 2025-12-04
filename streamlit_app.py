@@ -5,6 +5,9 @@ import openai
 import os
 import sqlite3
 import tempfile
+from math import radians, sin, cos, sqrt, atan2
+import folium
+from streamlit_folium import st_folium
 
 # Load API keys from .env for local development
 from dotenv import load_dotenv
@@ -53,6 +56,62 @@ def load_data_full():
         on_bad_lines="skip",
         low_memory=False,
     )
+
+
+def haversine_distance(lat1, lon1, lat2, lon2):
+    """
+    Calculate the great circle distance between two points 
+    on the earth (specified in decimal degrees)
+    Returns distance in kilometers
+    """
+    R = 6371  # Radius of earth in kilometers
+    
+    lat1, lon1, lat2, lon2 = map(radians, [lat1, lon1, lat2, lon2])
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    
+    a = sin(dlat/2)**2 + cos(lat1) * cos(lat2) * sin(dlon/2)**2
+    c = 2 * atan2(sqrt(a), sqrt(1-a))
+    distance = R * c
+    
+    return distance
+
+
+@st.cache_data(show_spinner=True)
+def find_longest_trip(df: pd.DataFrame):
+    """
+    Find the longest trip in the dataframe.
+    Filters out invalid lat/long values (0.0, None, NaN, NA, etc).
+    Returns the trip entry and its distance.
+    """
+    # Create a clean copy without modifying the original
+    clean_df = df[
+        (df['start_location_lat'].notna()) &
+        (df['start_location_long'].notna()) &
+        (df['end_location_lat'].notna()) &
+        (df['end_location_long'].notna()) &
+        (df['start_location_lat'] != 0.0) &
+        (df['start_location_long'] != 0.0) &
+        (df['end_location_lat'] != 0.0) &
+        (df['end_location_long'] != 0.0)
+    ].copy()
+    
+    # Calculate distance for each ride
+    clean_df['distance_km'] = clean_df.apply(
+        lambda row: haversine_distance(
+            row['start_location_lat'], 
+            row['start_location_long'],
+            row['end_location_lat'], 
+            row['end_location_long']
+        ),
+        axis=1
+    )
+    
+    # Find the entry with the most distance
+    max_distance_idx = clean_df['distance_km'].idxmax()
+    max_distance_entry = clean_df.loc[max_distance_idx]
+    
+    return max_distance_entry, max_distance_entry['distance_km']
 
 
 # Load a small sample immediately so the app starts quickly for health checks
@@ -286,7 +345,61 @@ tabs = st.tabs(["Interesting insights", "Chatbot"])
 
 with tabs[0]:
     st.header("Interesting insights")
-    st.write("Prototype tab — add dashboards, KPIs, and visualizations here.")
+    
+    # Show the longest trip on a map
+    st.subheader("Longest Trip Visualization")
+    try:
+        ensure_full_loaded()
+        full_df = st.session_state["df"]
+        longest_trip, distance_km = find_longest_trip(full_df)
+        
+        st.write(f"**Longest Trip Distance:** {distance_km:.2f} km")
+        
+        # Create a map centered on the midpoint between start and end
+        start_lat = longest_trip['start_location_lat']
+        start_lon = longest_trip['start_location_long']
+        end_lat = longest_trip['end_location_lat']
+        end_lon = longest_trip['end_location_long']
+        
+        center_lat = (start_lat + end_lat) / 2
+        center_lon = (start_lon + end_lon) / 2
+        
+        # Create folium map
+        m = folium.Map(
+            location=[center_lat, center_lon],
+            zoom_start=8,
+            tiles="OpenStreetMap"
+        )
+        
+        # Add markers for start and end locations
+        folium.Marker(
+            location=[start_lat, start_lon],
+            popup="Start Location",
+            tooltip="Start",
+            icon=folium.Icon(color="green", icon="info-sign")
+        ).add_to(m)
+        
+        folium.Marker(
+            location=[end_lat, end_lon],
+            popup="End Location",
+            tooltip="End",
+            icon=folium.Icon(color="red", icon="info-sign")
+        ).add_to(m)
+        
+        # Add a great circle line between start and end
+        folium.PolyLine(
+            locations=[[start_lat, start_lon], [end_lat, end_lon]],
+            color="blue",
+            weight=2,
+            opacity=0.8,
+            popup=f"Distance: {distance_km:.2f} km"
+        ).add_to(m)
+        
+        # Display the map
+        st_folium(m, width=700, height=500)
+        
+    except Exception as e:
+        st.error(f"Error loading longest trip visualization: {e}")
 
 with tabs[1]:
     st.header("Data Chatbot (Data-Only Answers)")
