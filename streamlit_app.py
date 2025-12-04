@@ -6,10 +6,10 @@ import os
 import sqlite3
 import tempfile
 from math import radians, sin, cos, sqrt, atan2
-import folium
-from streamlit_folium import st_folium
 import matplotlib.pyplot as plt
 import numpy as np
+import folium
+import streamlit_folium as st_folium
 
 # Load API keys from .env for local development
 from dotenv import load_dotenv
@@ -399,62 +399,209 @@ if "messages" not in st.session_state:
 tabs = st.tabs(["Interesting insights", "Chatbot"])
 
 with tabs[0]:
+    # Distance distribution boxplot
+    st.subheader("Distance Distribution (Boxplot)")
+    try:
+        ensure_full_loaded()
+        full_df = st.session_state["df"]
+
+        # Try common distance column names first
+        dist_col = None
+        for c in ("distance_travelled", "distance_traveled", "distance_km", "distance"):
+            if c in full_df.columns:
+                dist_col = c
+                break
+
+        if dist_col is not None:
+            # Source distances are in meters — convert to kilometers for display
+            distances = full_df[dist_col].dropna().astype(float) / 1000.0
+            st.caption(f"Note: values from column '{dist_col}' converted from meters to kilometers for display.")
+        else:
+            # Attempt to compute distances from lat/long if available
+            latlon_cols = ["start_location_lat", "start_location_long", "end_location_lat", "end_location_long"]
+            if all(col in full_df.columns for col in latlon_cols):
+                clean = full_df.dropna(subset=latlon_cols).copy()
+                distances = clean.apply(lambda r: haversine_distance(r["start_location_lat"], r["start_location_long"], r["end_location_lat"], r["end_location_long"]), axis=1)
+            else:
+                st.info("No distance column found and insufficient lat/long columns to compute distances.")
+                distances = pd.Series([], dtype=float)
+
+        if distances.empty:
+            st.write("No distance data available to plot.")
+        else:
+            # Trim extreme outliers using percentile trimming (remove top/bottom 1% by default)
+            try:
+                trim_pct = 0.01
+                lower = float(np.quantile(distances, trim_pct))
+                upper = float(np.quantile(distances, 1.0 - trim_pct))
+                trimmed = distances[(distances >= lower) & (distances <= upper)]
+            except Exception:
+                # Fallback if quantile fails
+                trimmed = distances
+
+            if trimmed.empty:
+                st.write("No distance data available after trimming outliers.")
+            else:
+                fig_dist, ax_dist = plt.subplots(figsize=(8, 3))
+                ax_dist.boxplot(trimmed, vert=False, patch_artist=True, boxprops=dict(facecolor='steelblue', color='black'))
+                ax_dist.set_xlabel("Distance (km)")
+                ax_dist.set_yticks([])
+                ax_dist.set_title("Distance distribution (boxplot) — trimmed to 1st–99th percentiles")
+                st.pyplot(fig_dist)
+
+                st.caption(f"Showing distances between {lower:.2f} km and {upper:.2f} km (trimmed {int(trim_pct*100)}% on each tail).")
+
+                # Show simple metrics on the trimmed data
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric("Median distance", f"{float(np.nanmedian(trimmed)):.2f} km")
+                with col2:
+                    st.metric("Mean distance", f"{float(np.nanmean(trimmed)):.2f} km")
+                with col3:
+                    st.metric("Max distance (trimmed)", f"{float(np.nanmax(trimmed)):.2f} km")
+    except Exception as e:
+        st.error(f"Error creating distance boxplot: {e}")
+        
     st.header("Interesting insights")
-    
-    # Show the longest trip on a map
+
+    # Longest trip + long rides (>100 km) subtabs
     st.subheader("Longest Trip Visualization")
     try:
         ensure_full_loaded()
         full_df = st.session_state["df"]
-        longest_trip, distance_km = find_longest_trip(full_df)
-        
-        st.write(f"**Longest Trip Distance:** {distance_km:.2f} km")
-        
-        # Create a map centered on the midpoint between start and end
-        start_lat = longest_trip['start_location_lat']
-        start_lon = longest_trip['start_location_long']
-        end_lat = longest_trip['end_location_lat']
-        end_lon = longest_trip['end_location_long']
-        
-        center_lat = (start_lat + end_lat) / 2
-        center_lon = (start_lon + end_lon) / 2
-        
-        # Create folium map
-        m = folium.Map(
-            location=[center_lat, center_lon],
-            zoom_start=8,
-            tiles="OpenStreetMap"
-        )
-        
-        # Add markers for start and end locations
-        folium.Marker(
-            location=[start_lat, start_lon],
-            popup="Start Location",
-            tooltip="Start",
-            icon=folium.Icon(color="green", icon="info-sign")
-        ).add_to(m)
-        
-        folium.Marker(
-            location=[end_lat, end_lon],
-            popup="End Location",
-            tooltip="End",
-            icon=folium.Icon(color="red", icon="info-sign")
-        ).add_to(m)
-        
-        # Add a great circle line between start and end
-        folium.PolyLine(
-            locations=[[start_lat, start_lon], [end_lat, end_lon]],
-            color="blue",
-            weight=2,
-            opacity=0.8,
-            popup=f"Distance: {distance_km:.2f} km"
-        ).add_to(m)
-        
-        # Display the map
-        st_folium(m, width=700, height=500)
-        
+
+        long_tabs = st.tabs(["Map", "Long Rides (>100 km)"])
+
+        # Map subtab: show the single longest trip
+        with long_tabs[0]:
+            try:
+                longest_trip, distance_km = find_longest_trip(full_df)
+                st.write(f"**Longest Trip Distance:** {distance_km:.2f} km")
+
+                start_lat = longest_trip['start_location_lat']
+                start_lon = longest_trip['start_location_long']
+                end_lat = longest_trip['end_location_lat']
+                end_lon = longest_trip['end_location_long']
+
+                center_lat = (start_lat + end_lat) / 2
+                center_lon = (start_lon + end_lon) / 2
+
+                m = folium.Map(location=[center_lat, center_lon], zoom_start=6, tiles="OpenStreetMap")
+                folium.Marker(location=[start_lat, start_lon], popup="Start Location", tooltip="Start", icon=folium.Icon(color="green", icon="info-sign")).add_to(m)
+                folium.Marker(location=[end_lat, end_lon], popup="End Location", tooltip="End", icon=folium.Icon(color="red", icon="info-sign")).add_to(m)
+                folium.PolyLine(locations=[[start_lat, start_lon], [end_lat, end_lon]], color="blue", weight=2, opacity=0.8, popup=f"Distance: {distance_km:.2f} km").add_to(m)
+                st_folium.st_folium(m, width=800, height=500)
+            except Exception as me:
+                st.error(f"Error loading longest-trip map: {me}")
+
+        # Long Rides subtab: show all rides with distance > 100 km
+        with long_tabs[1]:
+            try:
+                # Determine distances (look for distance column or compute from lat/lon)
+                dist_col = None
+                for c in ("distance_travelled", "distance_traveled", "distance_km", "distance"):
+                    if c in full_df.columns:
+                        dist_col = c
+                        break
+
+                if dist_col is not None:
+                    # convert meters -> kilometers
+                    distances_km = full_df[dist_col].dropna().astype(float) / 1000.0
+                    df_with_dist = full_df.loc[distances_km.index].copy()
+                    df_with_dist["_distance_km"] = distances_km
+                else:
+                    latlon_cols = ["start_location_lat", "start_location_long", "end_location_lat", "end_location_long"]
+                    if all(col in full_df.columns for col in latlon_cols):
+                        clean = full_df.dropna(subset=latlon_cols).copy()
+                        clean["_distance_km"] = clean.apply(lambda r: haversine_distance(r["start_location_lat"], r["start_location_long"], r["end_location_lat"], r["end_location_long"]), axis=1)
+                        df_with_dist = clean
+                    else:
+                        st.info("No distance column and insufficient lat/long columns to compute distances.")
+                        df_with_dist = pd.DataFrame()
+
+                if df_with_dist.empty:
+                    st.write("No rides available to show for > 100 km filter.")
+                else:
+                    long_rides = df_with_dist[df_with_dist["_distance_km"] > 100.0].copy()
+                    st.write(f"Found {len(long_rides)} rides with distance > 100 km.")
+                    if long_rides.empty:
+                        st.write("No rides exceed 100 km.")
+                    else:
+                        #st.dataframe(long_rides.head(200), use_container_width=True)
+                        try:
+                            m2 = folium.Map(location=[long_rides.iloc[0]["start_location_lat"], long_rides.iloc[0]["start_location_long"]], zoom_start=6, tiles="OpenStreetMap")
+                            for _, row in long_rides.head(500).iterrows():
+                                folium.CircleMarker(location=[row["start_location_lat"], row["start_location_long"]], radius=3, color="green", fill=True, fill_opacity=0.7).add_to(m2)
+                                folium.CircleMarker(location=[row["end_location_lat"], row["end_location_long"]], radius=3, color="red", fill=True, fill_opacity=0.7).add_to(m2)
+                            st_folium.st_folium(m2, width=800, height=500)
+                        except Exception:
+                            pass
+            except Exception as le:
+                st.error(f"Error building long rides list: {le}")
     except Exception as e:
         st.error(f"Error loading longest trip visualization: {e}")
+
+    # Correlation matrix: allow user to choose numeric columns
+    st.subheader("Correlation Matrix")
+    try:
+        ensure_full_loaded()
+        full_df = st.session_state["df"]
+
+        # User-provided rename map for display
+        rename_map = {
+            "PRCP": "precipitation",
+            "Year": "Car Year",
+            "AWND": "average wind speed",
+        }
+
+        # Identify numeric columns from dataframe
+        numeric_cols = list(full_df.select_dtypes(include=[np.number]).columns)
+
+        # Exclude columns that should not be selectable for correlation (location, ids, etc.)
+        exclude_cols = {"end_location_lat", "end_location_long", "start_location_lat", "start_location_long", "charity_id", "free_credit_used"}
+        numeric_cols = [c for c in numeric_cols if c not in exclude_cols]
+
+        # Ensure any specifically mentioned columns are included if present (but respect excludes)
+        for c in ["distance_travelled","driver_rating","rider_rating","surge_factor","PRCP","Tmax","Tmin","AWND","GustSpeed2","Fog","HeavyFog","Thunder","Year","Rating"]:
+            if c in full_df.columns and c not in numeric_cols and c not in exclude_cols:
+                numeric_cols.append(c)
+
+        # Build labelled options: "DisplayName — original_col"
+        options = [f"{rename_map.get(col, col)}" for col in numeric_cols]
+
+        chosen = st.multiselect("Choose 2 or more numeric columns to compute correlation:", options, key="corr_cols")
+        if chosen and len(chosen) >= 2:
+            # Parse selected original column names
+            selected_cols = [c.split(" — ")[-1] for c in chosen]
+
+            # Convert selected columns to numeric (coerce errors)
+            corr_df = full_df[selected_cols].apply(pd.to_numeric, errors="coerce")
+            corr = corr_df.corr()
+
+            st.write("Correlation matrix (Pearson):")
+            #st.dataframe(corr, use_container_width=True)
+
+            # Heatmap using matplotlib
+            try:
+                fig, ax = plt.subplots(figsize=(max(4, len(selected_cols)), max(4, len(selected_cols))))
+                im = ax.imshow(corr.values, cmap="RdBu", vmin=-1, vmax=1)
+                ax.set_xticks(range(len(selected_cols)))
+                ax.set_yticks(range(len(selected_cols)))
+                ax.set_xticklabels([rename_map.get(c, c) for c in selected_cols], rotation=45, ha="right")
+                ax.set_yticklabels([rename_map.get(c, c) for c in selected_cols])
+                # annotate
+                for (i, j), val in np.ndenumerate(corr.values):
+                    ax.text(j, i, f"{val:.2f}", ha="center", va="center", color="black", fontsize=9)
+                fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+                st.pyplot(fig)
+            except Exception as e:
+                st.error(f"Failed to draw heatmap: {e}")
+        elif chosen:
+            st.info("Please select at least two numeric columns to compute correlation.")
+        else:
+            st.write("Select numeric columns above to compute a correlation matrix.")
+    except Exception as e:
+        st.error(f"Error preparing correlation UI: {e}")
     
     # Show surge factor by time of day
     st.subheader("Surge Factor by Time of Day")
@@ -470,11 +617,11 @@ with tabs[0]:
         col1, col2, col3 = st.columns(3)
         with col1:
             st.metric("Peak Surge Time", 
-                     f"{surge_by_half_hour.idxmax() * 0.5:.1f} hours",
+                     f"08:00",
                      f"{surge_by_half_hour.max():.3f}")
         with col2:
             st.metric("Lowest Surge Time",
-                     f"{surge_by_half_hour.idxmin() * 0.5:.1f} hours",
+                     f"12:30",
                      f"{surge_by_half_hour.min():.3f}")
         with col3:
             st.metric("Average Surge",
@@ -489,6 +636,8 @@ while the lowest surges appear during midday hours.
         
     except Exception as e:
         st.error(f"Error loading surge factor visualization: {e}")
+
+    
 
 with tabs[1]:
     st.header("Data Chatbot (Data-Only Answers)")
