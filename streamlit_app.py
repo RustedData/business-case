@@ -10,7 +10,6 @@ import folium
 from streamlit_folium import st_folium
 import matplotlib.pyplot as plt
 import numpy as np
-import pydeck as pdk
 
 # Load API keys from .env for local development
 from dotenv import load_dotenv
@@ -168,58 +167,6 @@ def create_surge_by_hour_chart(df: pd.DataFrame):
     plt.tight_layout()
     
     return fig, surge_by_half_hour
-
-
-@st.cache_data(show_spinner=True)
-def create_start_locations_heatmap(df: pd.DataFrame):
-    """
-    Create a PyDeck hexagon heatmap showing ride start locations.
-    Returns the PyDeck chart object.
-    """
-    # Create a clean copy filtering for valid coordinates
-    clean_df = df[
-        (df['start_location_lat'].notna()) &
-        (df['start_location_long'].notna()) &
-        (df['start_location_lat'] != 0.0) &
-        (df['start_location_long'] != 0.0)
-    ].copy()
-    
-    # Calculate the center of the map
-    center_lat = clean_df['start_location_lat'].mean()
-    center_lon = clean_df['start_location_long'].mean()
-    
-    # Rename columns for PyDeck (it expects 'latitude' and 'longitude')
-    heatmap_data = clean_df[['start_location_lat', 'start_location_long']].copy()
-    heatmap_data.columns = ['latitude', 'longitude']
-    
-    # Create the hexagon layer
-    hexagon_layer = pdk.Layer(
-        'HexagonLayer',
-        data=heatmap_data,
-        get_position=['longitude', 'latitude'],
-        radius=500,
-        elevation_scale=4,
-        elevation_range=[0, 1000],
-        pickable=True,
-        extruded=True,
-        coverage=1,
-    )
-    
-    # Create the deck
-    r = pdk.Deck(
-        map_style='mapbox://styles/mapbox/light-v9',
-        initial_view_state=pdk.ViewState(
-            latitude=center_lat,
-            longitude=center_lon,
-            zoom=11,
-            bearing=0,
-            pitch=45,
-        ),
-        layers=[hexagon_layer],
-        tooltip={"text": "Ride Start Locations\n{count} rides"}
-    )
-    
-    return r
 
 
 # Load a small sample immediately so the app starts quickly for health checks
@@ -542,25 +489,6 @@ while the lowest surges appear during midday hours.
         
     except Exception as e:
         st.error(f"Error loading surge factor visualization: {e}")
-    
-    # Show ride start locations heatmap
-    st.subheader("Ride Start Locations Heatmap")
-    try:
-        ensure_full_loaded()
-        full_df = st.session_state["df"]
-        pydeck_chart = create_start_locations_heatmap(full_df)
-        
-        # Display the PyDeck chart
-        st.pydeck_chart(pydeck_chart)
-        
-        st.write("""
-**Insight:** The hexagon heatmap shows where rides start most frequently across the city. 
-Taller hexagons indicate areas with higher ride demand. This can help identify key pickup zones 
-and understand the geographic distribution of ride demand.
-        """)
-        
-    except Exception as e:
-        st.error(f"Error loading start locations heatmap: {e}")
 
 with tabs[1]:
     st.header("Data Chatbot (Data-Only Answers)")
