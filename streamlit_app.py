@@ -8,6 +8,8 @@ import tempfile
 from math import radians, sin, cos, sqrt, atan2
 import folium
 from streamlit_folium import st_folium
+import matplotlib.pyplot as plt
+import numpy as np
 
 # Load API keys from .env for local development
 from dotenv import load_dotenv
@@ -112,6 +114,59 @@ def find_longest_trip(df: pd.DataFrame):
     max_distance_entry = clean_df.loc[max_distance_idx]
     
     return max_distance_entry, max_distance_entry['distance_km']
+
+
+@st.cache_data(show_spinner=True)
+def create_surge_by_hour_chart(df: pd.DataFrame):
+    """
+    Create a circular histogram showing average surge_factor by half-hour.
+    Returns the matplotlib figure.
+    """
+    # Create a working copy
+    work_df = df.copy()
+    
+    # Convert started_on to datetime
+    work_df['started_on'] = pd.to_datetime(work_df['started_on'])
+    
+    # Extract hour and minute to create half-hour bins (0-47 for 48 half-hour periods in a day)
+    work_df['hour_minute'] = work_df['started_on'].dt.hour * 60 + work_df['started_on'].dt.minute
+    work_df['half_hour_bin'] = (work_df['hour_minute'] // 30).astype(int)
+    
+    # Calculate average surge_factor for each half-hour bin
+    surge_by_half_hour = work_df.groupby('half_hour_bin')['surge_factor'].mean()
+    
+    # Create a polar (circular) plot
+    fig = plt.figure(figsize=(10, 10))
+    ax = fig.add_subplot(111, projection='polar')
+    
+    # Create the angles for the polar plot (48 bins = 48 half-hour periods)
+    angles = np.linspace(0, 2 * np.pi, 48, endpoint=False)
+    values = surge_by_half_hour.values
+    
+    # Plot the bars
+    bars = ax.bar(angles, values, width=2*np.pi/48, alpha=0.8, color='steelblue', edgecolor='black', linewidth=0.5)
+    
+    # Set the angle for 0 to be at the top (12 o'clock position)
+    ax.set_theta_offset(np.pi / 2)
+    ax.set_theta_direction(-1)
+    
+    # Set the radial grid
+    ax.set_ylim(0, values.max() * 1.1)
+    
+    # Add hour labels at key positions (every 2 hours = 4 half-hour bins)
+    hour_angles = np.linspace(0, 2*np.pi, 24, endpoint=False)
+    hour_labels = [f"{i:02d}:00" for i in range(24)]
+    ax.set_xticks(hour_angles)
+    ax.set_xticklabels(hour_labels, size=8)
+    
+    # Set title and labels
+    ax.set_title('Average Surge Factor by Half-Hour of Day\n(Clock-like View)', 
+                 size=14, weight='bold', pad=20)
+    ax.set_ylabel('Surge Factor', labelpad=30)
+    
+    plt.tight_layout()
+    
+    return fig, surge_by_half_hour
 
 
 # Load a small sample immediately so the app starts quickly for health checks
@@ -400,6 +455,40 @@ with tabs[0]:
         
     except Exception as e:
         st.error(f"Error loading longest trip visualization: {e}")
+    
+    # Show surge factor by time of day
+    st.subheader("Surge Factor by Time of Day")
+    try:
+        ensure_full_loaded()
+        full_df = st.session_state["df"]
+        fig, surge_by_half_hour = create_surge_by_hour_chart(full_df)
+        
+        # Display the figure
+        st.pyplot(fig)
+        
+        # Show summary statistics
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Peak Surge Time", 
+                     f"{surge_by_half_hour.idxmax() * 0.5:.1f} hours",
+                     f"{surge_by_half_hour.max():.3f}")
+        with col2:
+            st.metric("Lowest Surge Time",
+                     f"{surge_by_half_hour.idxmin() * 0.5:.1f} hours",
+                     f"{surge_by_half_hour.min():.3f}")
+        with col3:
+            st.metric("Average Surge",
+                     "",
+                     f"{surge_by_half_hour.mean():.3f}")
+        
+        st.write("""
+**Insight:** There is a clear relationship between time of day and surge pricing. 
+Peak surges occur during typical commute hours (morning rush around 8 AM), 
+while the lowest surges appear during midday hours.
+        """)
+        
+    except Exception as e:
+        st.error(f"Error loading surge factor visualization: {e}")
 
 with tabs[1]:
     st.header("Data Chatbot (Data-Only Answers)")
